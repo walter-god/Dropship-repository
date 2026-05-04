@@ -1,0 +1,25 @@
+# Core runtime
+python-dotenv>=1.0.0
+apscheduler>=3.10.4
+
+# Data
+yfinance>=0.2.36
+pandas>=2.1.0
+numpy>=1.26.0
+requests>=2.31.0
+
+# Backtesting & optimisation
+vectorbt>=0.26.1
+optuna>=3.5.0
+
+# Technical indicators (used inside strategies)
+# No extra dependency needed — all indicators are implemented with pandas/numpy
+
+# Telegram
+python-telegram-bot>=21.0
+
+# MetaTrader 5 (Windows only — install manually on VPS)
+# MetaTrader5>=5.0.45
+
+# Logging
+colorlog>=6.8.2
