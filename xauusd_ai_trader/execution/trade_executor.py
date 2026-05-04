@@ -24,14 +24,24 @@ from utils.logger import get_logger
 log = get_logger(__name__)
 
 # MT5 order type constants
-OP_BUY = 0
-OP_SELL = 1
 ORDER_TYPE_BUY = 0
 ORDER_TYPE_SELL = 1
 TRADE_ACTION_DEAL = 1
-ORDER_FILLING_IOC = 1
+
+# Filling modes — retcode 10030 (INVALID_FILL) means the broker rejects the mode.
+# We probe all three and cache whichever works for the session.
+ORDER_FILLING_FOK    = 0  # Fill-or-Kill: must fill the entire volume immediately
+ORDER_FILLING_IOC    = 1  # Immediate-or-Cancel: fill what's available, cancel rest
+ORDER_FILLING_RETURN = 2  # Return: partial fills allowed (common on ECN/STP brokers)
+
+_FILLING_MODE_NAMES = {
+    ORDER_FILLING_FOK:    "FOK",
+    ORDER_FILLING_IOC:    "IOC",
+    ORDER_FILLING_RETURN: "RETURN",
+}
 
 _mt5_connected = False
+_cached_filling_mode: Optional[int] = None  # set after first successful probe
 
 
 def _get_mt5():
@@ -65,6 +75,73 @@ def _disconnect():
     mt5 = _get_mt5()
     if mt5:
         mt5.shutdown()
+
+
+def _broker_supported_filling_modes(mt5, symbol: str) -> list[int]:
+    """
+    Read the broker's advertised filling-mode bitmask from symbol_info and
+    return supported modes in preference order.
+
+    Bitmask bits (MetaTrader 5 docs):
+      bit 0 (value 1) → FOK
+      bit 1 (value 2) → IOC
+      bit 2 (value 4) → RETURN (called BOOK in some docs)
+    """
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        # Cannot determine — try all in order
+        return [ORDER_FILLING_FOK, ORDER_FILLING_IOC, ORDER_FILLING_RETURN]
+
+    mask = getattr(info, "filling_mode", 7)  # default to all bits set
+    modes = []
+    if mask & 1:
+        modes.append(ORDER_FILLING_FOK)
+    if mask & 2:
+        modes.append(ORDER_FILLING_IOC)
+    if mask & 4:
+        modes.append(ORDER_FILLING_RETURN)
+
+    if not modes:
+        modes = [ORDER_FILLING_FOK, ORDER_FILLING_IOC, ORDER_FILLING_RETURN]
+
+    log.debug("Broker filling_mode bitmask=%d → supported: %s",
+              mask, [_FILLING_MODE_NAMES[m] for m in modes])
+    return modes
+
+
+def _probe_filling_mode(mt5, base_request: dict, symbol: str) -> Optional[int]:
+    """
+    Try each supported filling mode with a check_order call (no real order placed).
+    Falls back to live order_send probing if check_order is not conclusive.
+    Returns the first working filling mode constant, or None if all fail.
+    """
+    global _cached_filling_mode
+    if _cached_filling_mode is not None:
+        return _cached_filling_mode
+
+    modes = _broker_supported_filling_modes(mt5, symbol)
+
+    for mode in modes:
+        req = {**base_request, "type_filling": mode}
+        # Use order_check() first — it validates without placing an order
+        check = mt5.order_check(req)
+        if check is not None and check.retcode in (0, 10009):
+            log.info("Filling mode %s accepted by broker (order_check)", _FILLING_MODE_NAMES[mode])
+            _cached_filling_mode = mode
+            return mode
+        if check is not None and check.retcode != 10030:
+            # A non-filling error (e.g. no price) — the mode itself is valid
+            log.info(
+                "Filling mode %s assumed valid (order_check retcode=%d != 10030)",
+                _FILLING_MODE_NAMES[mode], check.retcode,
+            )
+            _cached_filling_mode = mode
+            return mode
+        log.debug("Filling mode %s rejected (retcode=%s)", _FILLING_MODE_NAMES[mode],
+                  check.retcode if check else "None")
+
+    log.warning("No filling mode passed order_check — will try live probing")
+    return None
 
 
 class TradeExecutor:
@@ -128,7 +205,7 @@ class TradeExecutor:
         tick = mt5.symbol_info_tick(MT5_SYMBOL)
         close_price = tick.bid if close_type == ORDER_TYPE_SELL else tick.ask
 
-        request = {
+        base_request = {
             "action": TRADE_ACTION_DEAL,
             "symbol": MT5_SYMBOL,
             "volume": pos.volume,
@@ -138,9 +215,22 @@ class TradeExecutor:
             "deviation": 20,
             "magic": MT5_MAGIC,
             "comment": "xauusd_bot_close",
-            "type_filling": ORDER_FILLING_IOC,
         }
-        result = mt5.order_send(request)
+        filling = _cached_filling_mode or _probe_filling_mode(mt5, base_request, MT5_SYMBOL)
+        modes_to_try = ([filling] if filling is not None
+                        else [ORDER_FILLING_FOK, ORDER_FILLING_IOC, ORDER_FILLING_RETURN])
+
+        result = None
+        for mode in modes_to_try:
+            result = mt5.order_send({**base_request, "type_filling": mode})
+            if result and result.retcode == 10009:
+                break
+            if result and result.retcode == 10030:
+                log.debug("Close: filling mode %s rejected, trying next",
+                          _FILLING_MODE_NAMES.get(mode, mode))
+                continue
+            break  # any other retcode is a real error, stop trying modes
+
         if result and result.retcode == 10009:
             pnl = pos.profit
             db_manager.close_trade(trade_id, close_price, pnl)
@@ -209,7 +299,7 @@ class TradeExecutor:
         order_type = ORDER_TYPE_BUY if signal.direction == "BUY" else ORDER_TYPE_SELL
         price = tick.ask if signal.direction == "BUY" else tick.bid
 
-        request = {
+        base_request = {
             "action": TRADE_ACTION_DEAL,
             "symbol": MT5_SYMBOL,
             "volume": lot_size,
@@ -220,19 +310,54 @@ class TradeExecutor:
             "deviation": 20,
             "magic": MT5_MAGIC,
             "comment": f"xauusd_{signal.strategy}",
-            "type_filling": ORDER_FILLING_IOC,
         }
 
-        for attempt in range(3):
-            result = mt5.order_send(request)
-            if result and result.retcode == 10009:
-                return result.order
-            log.warning(
-                "Order attempt %d failed: retcode=%s comment=%s",
-                attempt + 1,
-                result.retcode if result else "N/A",
-                result.comment if result else "N/A",
-            )
-            time.sleep(1)
+        # Determine filling mode: use cached value, probe via order_check, or
+        # fall back to trying all modes live (handles retcode 10030).
+        filling = _probe_filling_mode(mt5, base_request, MT5_SYMBOL)
+        modes_to_try: list[int] = (
+            [filling] if filling is not None
+            else [ORDER_FILLING_FOK, ORDER_FILLING_IOC, ORDER_FILLING_RETURN]
+        )
+
+        for attempt in range(1, 4):  # up to 3 send attempts per mode
+            for mode in modes_to_try:
+                request = {**base_request, "type_filling": mode}
+                result = mt5.order_send(request)
+
+                if result and result.retcode == 10009:
+                    # Success — cache and return
+                    global _cached_filling_mode
+                    _cached_filling_mode = mode
+                    log.info(
+                        "Order placed — ticket=%d filling=%s attempt=%d",
+                        result.order, _FILLING_MODE_NAMES[mode], attempt,
+                    )
+                    return result.order
+
+                if result and result.retcode == 10030:
+                    # Invalid filling mode — try next mode in this attempt
+                    log.warning(
+                        "Filling mode %s rejected by broker (retcode=10030) — trying next",
+                        _FILLING_MODE_NAMES.get(mode, mode),
+                    )
+                    continue
+
+                # Any other retcode is a genuine execution error
+                log.warning(
+                    "Order attempt %d/%d failed: retcode=%s comment=%s filling=%s",
+                    attempt, 3,
+                    result.retcode if result else "N/A",
+                    result.comment if result else "N/A",
+                    _FILLING_MODE_NAMES.get(mode, mode),
+                )
+                break  # retry the whole attempt loop after a delay
+
+            else:
+                # All filling modes returned 10030 — nothing to retry
+                log.error("All filling modes rejected by broker — aborting order")
+                return None
+
+            time.sleep(attempt)  # 1s → 2s → 3s between attempts
 
         return None

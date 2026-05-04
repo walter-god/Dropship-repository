@@ -11,6 +11,7 @@ Sends:
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -21,9 +22,18 @@ from utils.logger import get_logger
 
 log = get_logger(__name__)
 
+# Send tuning — increase these if your VPS has high latency to Telegram servers
+TELEGRAM_CONNECT_TIMEOUT = 20.0   # seconds to establish the TCP connection
+TELEGRAM_READ_TIMEOUT = 30.0      # seconds to wait for a response after connecting
+TELEGRAM_WRITE_TIMEOUT = 30.0     # seconds to wait while uploading
+TELEGRAM_MAX_RETRIES = 3
+TELEGRAM_RETRY_BASE_DELAY = 2.0   # seconds; doubles on each retry (2 → 4 → 8)
+
 try:
     from telegram import Bot
     from telegram.constants import ParseMode
+    from telegram.error import NetworkError, RetryAfter, TimedOut
+    from telegram.request import HTTPXRequest
     TELEGRAM_AVAILABLE = True
 except ImportError:
     TELEGRAM_AVAILABLE = False
@@ -36,28 +46,63 @@ class TelegramAlerter:
         self.chat_id = chat_id
         self._bot: Optional["Bot"] = None
         if TELEGRAM_AVAILABLE and token and chat_id:
-            self._bot = Bot(token=token)
+            # Pass explicit timeouts to the underlying HTTPX client
+            request = HTTPXRequest(
+                connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
+                read_timeout=TELEGRAM_READ_TIMEOUT,
+                write_timeout=TELEGRAM_WRITE_TIMEOUT,
+            )
+            self._bot = Bot(token=token, request=request)
         else:
             log.warning("Telegram bot not configured — alerts will be logged only")
 
-    # ── Internal send ─────────────────────────────────────────────────────────
+    # ── Internal send with retry ──────────────────────────────────────────────
 
     def _send(self, text: str) -> None:
         if self._bot is None:
             log.info("[TELEGRAM ALERT]\n%s", text)
             return
-        try:
-            loop = asyncio.new_event_loop()
-            loop.run_until_complete(
-                self._bot.send_message(
-                    chat_id=self.chat_id,
-                    text=text,
-                    parse_mode=ParseMode.HTML,
+
+        delay = TELEGRAM_RETRY_BASE_DELAY
+        for attempt in range(1, TELEGRAM_MAX_RETRIES + 1):
+            try:
+                loop = asyncio.new_event_loop()
+                try:
+                    loop.run_until_complete(
+                        self._bot.send_message(
+                            chat_id=self.chat_id,
+                            text=text,
+                            parse_mode=ParseMode.HTML,
+                        )
+                    )
+                finally:
+                    loop.close()
+                return  # success — exit immediately
+
+            except RetryAfter as exc:
+                # Telegram told us exactly how long to wait
+                wait = exc.retry_after + 1
+                log.warning(
+                    "Telegram rate-limited — waiting %ds before retry (attempt %d/%d)",
+                    wait, attempt, TELEGRAM_MAX_RETRIES,
                 )
-            )
-            loop.close()
-        except Exception as exc:
-            log.error("Telegram send failed: %s", exc)
+                time.sleep(wait)
+
+            except (TimedOut, NetworkError) as exc:
+                log.warning(
+                    "Telegram transient error on attempt %d/%d: %s — retrying in %ds",
+                    attempt, TELEGRAM_MAX_RETRIES, exc, delay,
+                )
+                if attempt < TELEGRAM_MAX_RETRIES:
+                    time.sleep(delay)
+                    delay *= 2  # exponential backoff
+
+            except Exception as exc:
+                # Non-retryable (bad token, chat not found, etc.)
+                log.error("Telegram send failed (non-retryable): %s", exc)
+                return
+
+        log.error("Telegram send gave up after %d attempts", TELEGRAM_MAX_RETRIES)
 
     # ── Signal alert ──────────────────────────────────────────────────────────
 
