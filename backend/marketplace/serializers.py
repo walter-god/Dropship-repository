@@ -20,7 +20,9 @@ class CategorySerializer(serializers.ModelSerializer):
         read_only_fields = ['slug']
 
     def get_app_count(self, obj) -> int:
-        return obj.applications.filter(status=Application.STATUS_APPROVED, is_active=True).count()
+        return obj.applications.filter(
+            status__in=Application.PUBLIC_STATUSES, is_active=True
+        ).count()
 
 
 # ---------------------------------------------------------------------------

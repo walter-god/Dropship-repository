@@ -7,3 +7,10 @@ Pillow==10.1.0
 python-decouple==3.8
 django-filter==23.5
 drf-spectacular==0.26.5
+
+# Deployment pipeline
+docker==7.0.0
+celery==5.3.6
+redis==5.0.1
+cryptography==41.0.7
+requests==2.31.0

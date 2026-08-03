@@ -19,6 +19,7 @@ urlpatterns = [
     path('api/marketplace/', include('marketplace.urls')),
     path('api/subscriptions/', include('subscriptions.urls')),
     path('api/payments/', include('payments.urls')),
+    path('api/deployer/', include('deployer.urls')),
 
     # API schema and documentation
     path('api/schema/', SpectacularAPIView.as_view(), name='schema'),

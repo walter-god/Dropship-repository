@@ -84,10 +84,10 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         if user.is_authenticated and user.is_internal:
             # Internal users see approved + their own pending/rejected
             return qs.filter(
-                status=Application.STATUS_APPROVED, is_active=True
+                status__in=Application.PUBLIC_STATUSES, is_active=True
             ) | qs.filter(developer=user)
         # Public / external: only approved active apps
-        return qs.filter(status=Application.STATUS_APPROVED, is_active=True)
+        return qs.filter(status__in=Application.PUBLIC_STATUSES, is_active=True)
 
     def get_serializer_class(self):
         if self.action in ('create', 'update', 'partial_update'):
@@ -160,7 +160,7 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         Permission: internal/admin users always pass; external users need a subscription.
         """
         app = self.get_object()
-        if app.status != Application.STATUS_APPROVED or not app.is_active:
+        if app.status not in Application.PUBLIC_STATUSES or not app.is_active:
             return Response(
                 {'error': 'This application is not available for download.'},
                 status=status.HTTP_404_NOT_FOUND,

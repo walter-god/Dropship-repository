@@ -42,12 +42,18 @@ class Application(models.Model):
     STATUS_PENDING = 'pending'
     STATUS_APPROVED = 'approved'
     STATUS_REJECTED = 'rejected'
+    STATUS_PUBLISHED = 'published'
 
     STATUS_CHOICES = [
         (STATUS_PENDING, _('Pending')),
         (STATUS_APPROVED, _('Approved')),
         (STATUS_REJECTED, _('Rejected')),
+        (STATUS_PUBLISHED, _('Published')),
     ]
+
+    # Statuses visible to the public: approved apps are browsable, published
+    # apps are approved AND running behind the gateway.
+    PUBLIC_STATUSES = (STATUS_APPROVED, STATUS_PUBLISHED)
 
     name = models.CharField(max_length=200)
     slug = models.SlugField(max_length=220, unique=True, blank=True)
@@ -68,6 +74,15 @@ class Application(models.Model):
     app_file = models.FileField(
         upload_to='apps/files/',
         help_text=_('Uploadable package (APK, IPA, ZIP, etc.).'),
+    )
+    source_code = models.FileField(
+        upload_to='projects/source/',
+        blank=True,
+        null=True,
+        help_text=_(
+            'Zipped project source. This is the build input for the deployment '
+            'pipeline, distinct from app_file which is the distributable package.'
+        ),
     )
     icon = models.ImageField(
         upload_to='apps/icons/',
