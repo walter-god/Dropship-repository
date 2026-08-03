@@ -16,7 +16,7 @@ from .validators import validate_source_archive
 
 from .filters import ApplicationFilter
 from .models import Application, AppVersion, Category, Download, Review
-from .permissions import HasActiveSubscription, IsAdminUser, IsInternalOrAdmin, IsOwnerOrAdmin
+from .permissions import IsAdminUser, IsInternalOrAdmin, IsOwnerOrAdmin
 from .serializers import (
     ApplicationCreateSerializer,
     ApplicationDetailSerializer,
@@ -124,7 +124,12 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         if self.action in ('list', 'retrieve', 'featured'):
             return [AllowAny()]
         if self.action == 'download':
-            return [IsAuthenticated(), HasActiveSubscription()]
+            # Not HasActiveSubscription here: that would block an external
+            # user from a FREE app before the view body ever runs, even
+            # though the body already implements the correct rule (external
+            # users only need a subscription for paid apps). Gating at the
+            # permission layer made that body check dead code.
+            return [IsAuthenticated()]
         if self.action in ('create',):
             return [IsAuthenticated(), IsInternalOrAdmin()]
         if self.action in ('update', 'partial_update', 'destroy'):
