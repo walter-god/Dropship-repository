@@ -100,6 +100,16 @@ class HostedApp(models.Model):
     memory_limit_mb = models.PositiveIntegerField(default=512)
     cpu_limit = models.FloatField(default=0.5)
 
+    allow_egress = models.BooleanField(
+        default=False,
+        help_text=_(
+            'Off by default: the app runs on an internal Docker network with no '
+            'route off the host. Enable only for apps that genuinely need to call '
+            'an external API — it also restores the container’s ability to reach '
+            'the internet, the host LAN, and cloud metadata endpoints.'
+        ),
+    )
+
     last_active_at = models.DateTimeField(null=True, blank=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

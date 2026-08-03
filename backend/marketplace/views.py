@@ -1,5 +1,6 @@
 """Views for the UDOM Digital Marketplace."""
 
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.utils.decorators import method_decorator
 from django.views.decorators.cache import cache_page
@@ -8,7 +9,10 @@ from rest_framework.decorators import action
 from rest_framework.parsers import FormParser, MultiPartParser, JSONParser
 from rest_framework.permissions import AllowAny, IsAuthenticated, IsAuthenticatedOrReadOnly
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
+
+from .validators import validate_source_archive
 
 from .filters import ApplicationFilter
 from .models import Application, AppVersion, Category, Download, Review
@@ -17,6 +21,7 @@ from .serializers import (
     ApplicationCreateSerializer,
     ApplicationDetailSerializer,
     ApplicationListSerializer,
+    ApplicationPrivilegedDetailSerializer,
     AppVersionSerializer,
     CategorySerializer,
     DownloadSerializer,
@@ -57,6 +62,9 @@ class ApplicationViewSet(viewsets.ModelViewSet):
     """
 
     parser_classes = [MultiPartParser, FormParser, JSONParser]
+    # Declared so per-action @action(throttle_scope=...) overrides are accepted
+    # as initkwargs; DRF rejects any kwarg the class does not already define.
+    throttle_scope = None
     filter_backends = [
         filters.SearchFilter,
         filters.OrderingFilter,
@@ -93,8 +101,24 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         if self.action in ('create', 'update', 'partial_update'):
             return ApplicationCreateSerializer
         if self.action == 'retrieve':
+            # `retrieve` is AllowAny, so the default detail serializer must stay
+            # free of source_code / deployment_notes / demo_credentials. Only
+            # the owner or an admin gets the privileged variant.
+            if self._is_owner_or_admin():
+                return ApplicationPrivilegedDetailSerializer
             return ApplicationDetailSerializer
         return ApplicationListSerializer
+
+    def _is_owner_or_admin(self) -> bool:
+        user = self.request.user
+        if not user or not user.is_authenticated:
+            return False
+        if user.is_admin or user.is_staff:
+            return True
+        # get_object() would recurse through permissions; look the owner up directly.
+        return Application.objects.filter(
+            pk=self.kwargs.get('pk'), developer=user
+        ).exists()
 
     def get_permissions(self):
         if self.action in ('list', 'retrieve', 'featured'):
@@ -155,6 +179,10 @@ class ApplicationViewSet(viewsets.ModelViewSet):
     @action(
         detail=False, methods=['post'], url_path='detect-stack',
         permission_classes=[IsAuthenticated],
+        # Parsing attacker-supplied zips is CPU- and memory-bound; without a
+        # dedicated bucket this is a cheap DoS for any authenticated user.
+        throttle_classes=[ScopedRateThrottle],
+        throttle_scope='detect_stack',
     )
     def detect_stack(self, request):
         """
@@ -169,6 +197,12 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             return Response(
                 {'error': "A 'source_code' zip file is required."},
                 status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            validate_source_archive(upload)
+        except DjangoValidationError as exc:
+            return Response(
+                {'error': ' '.join(exc.messages)}, status=status.HTTP_400_BAD_REQUEST
             )
         from deployer.detection import detect_from_archive
         return Response(detect_from_archive(upload))

@@ -89,6 +89,7 @@ def safe_extract(
     dest_dir: str | Path,
     max_bytes: int | None = None,
     max_files: int | None = None,
+    max_ratio: int | None = None,
 ) -> ExtractionResult:
     """Extract `zip_path` into `dest_dir`, enforcing safety and size limits."""
     zip_path = Path(zip_path)
@@ -99,6 +100,8 @@ def safe_extract(
         max_bytes = settings.DEPLOYER_MAX_EXTRACTED_MB * 1024 * 1024
     if max_files is None:
         max_files = settings.DEPLOYER_MAX_EXTRACTED_FILES
+    if max_ratio is None:
+        max_ratio = settings.DEPLOYER_MAX_COMPRESSION_RATIO
 
     if not zip_path.is_file():
         raise UnsafeArchive(f'Source archive not found at {zip_path}')
@@ -126,6 +129,25 @@ def safe_extract(
             raise UnsafeArchive(
                 f'Archive contains {len(infos)} entries, over the {max_files} limit.'
             )
+
+        # Compression ratio, checked separately from absolute size: a 500 KB
+        # archive that expands to just under the size cap still costs real CPU
+        # and I/O, and no honest source tree compresses anywhere near this
+        # hard. Per-entry as well as aggregate, so one pathological member
+        # cannot hide inside an otherwise normal archive.
+        compressed = sum(i.compress_size for i in infos)
+        if compressed > 0 and (declared / compressed) > max_ratio:
+            raise UnsafeArchive(
+                f'Archive compression ratio is {declared // max(compressed, 1)}:1, over '
+                f'the {max_ratio}:1 limit — this looks like a decompression bomb.'
+            )
+        for info in infos:
+            if info.compress_size > 0 and (info.file_size / info.compress_size) > max_ratio:
+                raise UnsafeArchive(
+                    f'Entry {info.filename!r} has a compression ratio of '
+                    f'{info.file_size // max(info.compress_size, 1)}:1, over the '
+                    f'{max_ratio}:1 limit.'
+                )
 
         for info in infos:
             target = _validate(info, dest)

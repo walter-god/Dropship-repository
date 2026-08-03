@@ -145,7 +145,28 @@ REST_FRAMEWORK = {
     'DEFAULT_THROTTLE_RATES': {
         'anon': '100/hour',
         'user': '1000/hour',
+        # Scoped buckets for the endpoints an attacker actually targets.
+        'login': '10/minute',
+        'register': '5/hour',
+        'payment_webhook': '60/minute',
+        'detect_stack': '20/hour',
     },
+    # Without this, AnonRateThrottle keys on the client-supplied
+    # X-Forwarded-For, which anything on the Docker network (including a
+    # student container) can rotate freely to defeat rate limiting entirely.
+    # 1 == exactly one trusted proxy in front of Django (nginx).
+    'NUM_PROXIES': config('NUM_PROXIES', default=1, cast=int),
+}
+
+# Throttle counters and the gateway hostname allowlist both live in the cache.
+# With Django's default per-process LocMemCache, throttle limits would multiply
+# by the number of workers and an allowlist revocation in the Celery worker
+# would never reach the web process. Redis is already running for Celery.
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+        'LOCATION': config('CACHE_URL', default='redis://redis:6379/2'),
+    }
 }
 
 # JWT Settings
@@ -201,6 +222,10 @@ SPECTACULAR_SETTINGS = {
         'displayOperationId': True,
     },
     'SECURITY': [{'BearerAuth': []}],
+    # drf-spectacular serves the schema to anyone by default. A full API map is
+    # free reconnaissance for an attacker — and every student container can
+    # reach this backend.
+    'SERVE_PERMISSIONS': ['rest_framework.permissions.IsAdminUser'],
     'APPEND_COMPONENTS': {
         'securitySchemes': {
             'BearerAuth': {
@@ -215,6 +240,43 @@ SPECTACULAR_SETTINGS = {
 # File upload settings
 DATA_UPLOAD_MAX_MEMORY_SIZE = 52428800   # 50 MB
 FILE_UPLOAD_MAX_MEMORY_SIZE = 52428800   # 50 MB
+
+# Neither of the above caps an uploaded FILE's size — Django exempts file
+# fields from DATA_UPLOAD_MAX_MEMORY_SIZE, and FILE_UPLOAD_MAX_MEMORY_SIZE is
+# only the memory-vs-disk spill threshold. These are enforced explicitly in
+# marketplace/validators.py, which also runs for requests that reach the
+# backend directly and so bypass nginx's client_max_body_size.
+MARKETPLACE_MAX_SOURCE_UPLOAD_MB = config('MARKETPLACE_MAX_SOURCE_UPLOAD_MB', default=100, cast=int)
+MARKETPLACE_MAX_APP_FILE_MB = config('MARKETPLACE_MAX_APP_FILE_MB', default=500, cast=int)
+
+# ---------------------------------------------------------------------------
+# Payments
+# ---------------------------------------------------------------------------
+# Shared secret for verifying the HMAC-SHA256 signature on payment webhooks.
+# The webhook is unauthenticated by necessity, so this signature IS its
+# authentication. Empty means the endpoint rejects everything (fail closed).
+PAYMENTS_WEBHOOK_SECRET = config('PAYMENTS_WEBHOOK_SECRET', default='')
+
+# ---------------------------------------------------------------------------
+# Transport / cookie hardening
+# ---------------------------------------------------------------------------
+# Applied only outside DEBUG so local HTTP development still works. Behind
+# nginx, Django needs the forwarded-proto header to know a request was HTTPS.
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SECURE_REFERRER_POLICY = 'same-origin'
+X_FRAME_OPTIONS = 'DENY'
+
+if not DEBUG:
+    SECURE_SSL_REDIRECT = config('SECURE_SSL_REDIRECT', default=True, cast=bool)
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SESSION_COOKIE_HTTPONLY = True
+    SESSION_COOKIE_SAMESITE = 'Lax'
+    CSRF_COOKIE_SAMESITE = 'Lax'
+    SECURE_HSTS_SECONDS = config('SECURE_HSTS_SECONDS', default=31536000, cast=int)
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
 
 # ---------------------------------------------------------------------------
 # Celery
@@ -290,6 +352,22 @@ DEPLOYER_PIDS_LIMIT = config('DEPLOYER_PIDS_LIMIT', default=256, cast=int)
 DEPLOYER_DEFAULT_MEMORY_MB = config('DEPLOYER_DEFAULT_MEMORY_MB', default=512, cast=int)
 DEPLOYER_DEFAULT_CPU = config('DEPLOYER_DEFAULT_CPU', default=0.5, cast=float)
 
+# The root filesystem is read-only, so writable paths are tmpfs. Sized, because
+# an unbounded tmpfs is RAM a container can consume past its memory limit.
+DEPLOYER_TMPFS_SIZE_MB = config('DEPLOYER_TMPFS_SIZE_MB', default=64, cast=int)
+
+# nofile/nproc bound fd and thread exhaustion; fsize bounds how large a single
+# file can grow inside the writable tmpfs layers.
+DEPLOYER_ULIMITS = {
+    'nofile': config('DEPLOYER_ULIMIT_NOFILE', default=1024, cast=int),
+    'nproc': config('DEPLOYER_ULIMIT_NPROC', default=256, cast=int),
+    'fsize': config('DEPLOYER_ULIMIT_FSIZE', default=256 * 1024 * 1024, cast=int),
+}
+
+# Zip bombs: total extracted size alone is not enough, because a small archive
+# with an enormous ratio still costs CPU and I/O to discover.
+DEPLOYER_MAX_COMPRESSION_RATIO = config('DEPLOYER_MAX_COMPRESSION_RATIO', default=100, cast=int)
+
 # Health check
 DEPLOYER_HEALTH_TIMEOUT_SECONDS = config('DEPLOYER_HEALTH_TIMEOUT_SECONDS', default=90, cast=int)
 DEPLOYER_HEALTH_POLL_INTERVAL_SECONDS = config(
@@ -309,6 +387,13 @@ DEPLOYER_APP_DB_PASSWORD = config(
 )
 # Hostname student containers use to reach Postgres (Docker DNS, not localhost).
 DEPLOYER_APP_DB_INTERNAL_HOST = config('DEPLOYER_APP_DB_INTERNAL_HOST', default='db')
+
+# Caps how many Postgres connections one student app can hold, so a hostile or
+# leaking app cannot exhaust the shared instance's connection slots and take
+# the platform down with it.
+DEPLOYER_APP_DB_CONNECTION_LIMIT = config(
+    'DEPLOYER_APP_DB_CONNECTION_LIMIT', default=20, cast=int
+)
 
 # Fernet key for HostedApp.env_vars. Defaults to a value derived from
 # SECRET_KEY so development works unconfigured — set explicitly in production,

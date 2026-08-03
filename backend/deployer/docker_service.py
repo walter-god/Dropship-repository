@@ -24,6 +24,37 @@ logger = logging.getLogger(__name__)
 MANAGED_LABEL = 'udom.managed'
 SLUG_LABEL = 'udom.app_slug'
 
+# Never permitted when starting a student container. `volumes`/`mounts`/
+# `binds` would allow mounting the Docker socket (host root); `devices`,
+# `privileged`, `pid`/`ipc`/`userns` host modes and `cap_add` all dissolve the
+# isolation boundary; `ports` would make the app reachable without passing the
+# gateway's subscription check.
+FORBIDDEN_RUN_KWARGS = (
+    'volumes', 'mounts', 'binds', 'devices', 'device_requests', 'privileged',
+    'pid_mode', 'ipc_mode', 'userns_mode', 'cap_add', 'ports', 'publish_all_ports',
+    'network_mode', 'sysctls', 'cgroupns',
+)
+
+
+class UnsafeContainerConfig(Exception):
+    """A student container was about to be started with host access."""
+
+
+def _assert_no_host_access(run_kwargs: dict) -> None:
+    """Fail closed if a forbidden kwarg ever reaches containers.run()."""
+    for key in FORBIDDEN_RUN_KWARGS:
+        value = run_kwargs.get(key)
+        if value:
+            raise UnsafeContainerConfig(
+                f'Refusing to start a student container with {key}={value!r}. '
+                'Student containers must never be given host access.'
+            )
+    # Defence in depth: even an allowed kwarg must not smuggle the socket in.
+    if 'docker.sock' in repr(run_kwargs):
+        raise UnsafeContainerConfig(
+            'Refusing to start a student container referencing the Docker socket.'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Errors — the public failure vocabulary
@@ -98,6 +129,25 @@ class NetworkInfo:
     name: str
 
 
+@dataclass(frozen=True)
+class AppliedLimits:
+    """What the daemon actually applied, read back after start.
+
+    Docker only *warns* when a limit is unsupported by the host's cgroup
+    driver — the container still starts. Without reading this back, a deploy
+    would report success while running with no memory or pids cap at all.
+    """
+    memory_bytes: int
+    nano_cpus: int
+    pids_limit: int
+    cap_drop: tuple[str, ...]
+    read_only_rootfs: bool
+    user: str
+    network_mode: str
+    privileged: bool
+    mounts: tuple[str, ...]
+
+
 # ---------------------------------------------------------------------------
 # Interface
 # ---------------------------------------------------------------------------
@@ -122,7 +172,9 @@ class DockerService(ABC):
 
     # -- networks ----------------------------------------------------------
     @abstractmethod
-    def ensure_network(self, name: str, labels: dict | None = None) -> NetworkInfo: ...
+    def ensure_network(
+        self, name: str, labels: dict | None = None, internal: bool = True
+    ) -> NetworkInfo: ...
 
     @abstractmethod
     def remove_network(self, name: str) -> None: ...
@@ -146,7 +198,14 @@ class DockerService(ABC):
         user: str,
         pids_limit: int,
         labels: dict | None = None,
+        tmpfs: dict | None = None,
+        read_only: bool = True,
+        ulimits: dict | None = None,
     ) -> ContainerInfo: ...
+
+    @abstractmethod
+    def inspect_limits(self, ref: str) -> AppliedLimits:
+        """Read back the limits the daemon actually applied to a container."""
 
     @abstractmethod
     def start_container(self, ref: str) -> None: ...
@@ -304,11 +363,38 @@ class LocalDockerService(DockerService):
 
     # -- networks ----------------------------------------------------------
 
-    def ensure_network(self, name: str, labels: dict | None = None) -> NetworkInfo:
+    def ensure_network(
+        self, name: str, labels: dict | None = None, internal: bool = True
+    ) -> NetworkInfo:
+        """Create (or reuse) a per-app network.
+
+        `internal=True` removes the NAT gateway, so containers on the network
+        can still reach each other — the backend, the worker, and Postgres when
+        attached — but have no route off the host. That is the control that
+        stops a hostile app from mining, exfiltrating, scanning the LAN, or
+        reading the cloud metadata endpoint.
+
+        Docker cannot toggle `internal` on an existing network, so a network
+        whose flag no longer matches is torn down and recreated.
+        """
         from docker.errors import APIError, NotFound
         try:
             net = self.client.networks.get(name)
-            return NetworkInfo(id=net.id, name=net.name)
+            current = bool(net.attrs.get('Internal', False))
+            if current == internal:
+                return NetworkInfo(id=net.id, name=net.name)
+            logger.info(
+                'Network %s has internal=%s but %s is required; recreating.',
+                name, current, internal,
+            )
+            # Containers are recreated on every deploy anyway, so disconnecting
+            # them here loses nothing.
+            for container_id in (net.attrs.get('Containers') or {}):
+                try:
+                    net.disconnect(container_id, force=True)
+                except APIError:
+                    pass
+            net.remove()
         except NotFound:
             pass
         except APIError as exc:
@@ -316,7 +402,7 @@ class LocalDockerService(DockerService):
 
         try:
             net = self.client.networks.create(
-                name, driver='bridge', labels=self._labels(labels)
+                name, driver='bridge', internal=internal, labels=self._labels(labels)
             )
         except APIError as exc:
             # Lost a race with a concurrent deploy — re-fetch rather than fail.
@@ -372,27 +458,48 @@ class LocalDockerService(DockerService):
         user: str,
         pids_limit: int,
         labels: dict | None = None,
+        tmpfs: dict | None = None,
+        read_only: bool = True,
+        ulimits: dict | None = None,
     ) -> ContainerInfo:
         from docker.errors import APIError, ImageNotFound
+        from docker.types import Ulimit
+
+        # This container runs hostile code. These kwargs are never permitted,
+        # and asserting it here means a future edit that adds a bind mount —
+        # above all /var/run/docker.sock, which would be a direct host-root
+        # escape — fails loudly instead of silently shipping.
+        run_kwargs = dict(
+            image=image_tag,
+            name=name,
+            detach=True,
+            environment={k: str(v) for k, v in environment.items()},
+            # Exactly one network, and no `ports` argument anywhere: the app
+            # must be unreachable except through the gateway, or the
+            # subscription check is trivially bypassed.
+            network=network,
+            mem_limit=f'{memory_mb}m',
+            # Cap swap at the memory limit too, or a container simply swaps
+            # past its cgroup ceiling and takes the host's disk with it.
+            memswap_limit=f'{memory_mb}m',
+            nano_cpus=int(cpu_limit * 1_000_000_000),
+            pids_limit=pids_limit,
+            user=user,
+            restart_policy={'Name': 'unless-stopped'},
+            cap_drop=['ALL'],
+            security_opt=['no-new-privileges:true'],
+            read_only=read_only,
+            tmpfs=tmpfs or {},
+            ulimits=[
+                Ulimit(name=key, soft=value, hard=value)
+                for key, value in (ulimits or {}).items()
+            ],
+            labels=self._labels(labels),
+        )
+        _assert_no_host_access(run_kwargs)
+
         try:
-            container = self.client.containers.run(
-                image=image_tag,
-                name=name,
-                detach=True,
-                environment={k: str(v) for k, v in environment.items()},
-                # Exactly one network, and no `ports` argument anywhere: the
-                # app must be unreachable except through the gateway, or the
-                # subscription check is trivially bypassed.
-                network=network,
-                mem_limit=f'{memory_mb}m',
-                nano_cpus=int(cpu_limit * 1_000_000_000),
-                pids_limit=pids_limit,
-                user=user,
-                restart_policy={'Name': 'unless-stopped'},
-                cap_drop=['ALL'],
-                security_opt=['no-new-privileges'],
-                labels=self._labels(labels),
-            )
+            container = self.client.containers.run(**run_kwargs)
         except ImageNotFound as exc:
             raise ResourceNotFound(f'Image {image_tag} not found.') from exc
         except APIError as exc:
@@ -400,6 +507,26 @@ class LocalDockerService(DockerService):
 
         container.reload()
         return ContainerInfo(id=container.id, name=container.name, status=container.status)
+
+    def inspect_limits(self, ref: str) -> AppliedLimits:
+        container = self._get(ref)
+        container.reload()
+        host_config = container.attrs.get('HostConfig', {}) or {}
+        config = container.attrs.get('Config', {}) or {}
+        mounts = tuple(
+            m.get('Source', '') for m in (container.attrs.get('Mounts') or [])
+        )
+        return AppliedLimits(
+            memory_bytes=int(host_config.get('Memory') or 0),
+            nano_cpus=int(host_config.get('NanoCpus') or 0),
+            pids_limit=int(host_config.get('PidsLimit') or 0),
+            cap_drop=tuple(host_config.get('CapDrop') or ()),
+            read_only_rootfs=bool(host_config.get('ReadonlyRootfs', False)),
+            user=str(config.get('User') or ''),
+            network_mode=str(host_config.get('NetworkMode') or ''),
+            privileged=bool(host_config.get('Privileged', False)),
+            mounts=mounts,
+        )
 
     def _get(self, ref: str):
         from docker.errors import APIError, NotFound

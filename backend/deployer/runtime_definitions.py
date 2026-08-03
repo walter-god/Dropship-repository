@@ -149,6 +149,8 @@ RUNTIME_TEMPLATES = [
         'default_port': 8000,
         'migrate_command': 'python manage.py migrate --noinput',
         'needs_database': True,
+        # Gunicorn worker heartbeats, collectstatic output, uploads.
+        'tmpfs_paths': ['/app/staticfiles', '/app/media'],
         'detection_hints': {
             'priority': 90,
             'require_files': ['manage.py'],
@@ -163,6 +165,8 @@ RUNTIME_TEMPLATES = [
         'default_port': 3000,
         'migrate_command': None,
         'needs_database': False,
+        # Next.js writes its incremental cache under .next at runtime.
+        'tmpfs_paths': ['/app/.next/cache', '/app/.npm'],
         'detection_hints': {
             'priority': 85,
             'require_files': ['package.json'],
@@ -177,6 +181,14 @@ RUNTIME_TEMPLATES = [
         'default_port': 8080,
         'migrate_command': 'php artisan migrate --force',
         'needs_database': True,
+        # Laravel compiles views, writes sessions and logs on every request.
+        'tmpfs_paths': [
+            '/app/storage/framework/sessions',
+            '/app/storage/framework/views',
+            '/app/storage/framework/cache',
+            '/app/storage/logs',
+            '/app/bootstrap/cache',
+        ],
         'detection_hints': {
             'priority': 80,
             'require_files': ['artisan', 'composer.json'],
@@ -190,6 +202,7 @@ RUNTIME_TEMPLATES = [
         'default_port': 8000,
         'migrate_command': None,
         'needs_database': False,
+        'tmpfs_paths': [],
         'detection_hints': {
             'priority': 70,
             'require_files': ['requirements.txt'],
@@ -207,6 +220,8 @@ RUNTIME_TEMPLATES = [
         'default_port': 8080,
         'migrate_command': None,
         'needs_database': False,
+        # nginx-unprivileged keeps its cache and pid under these paths.
+        'tmpfs_paths': ['/var/cache/nginx', '/var/run', '/tmp/nginx'],
         'detection_hints': {
             'priority': 65,
             'require_files': ['package.json'],
@@ -223,6 +238,7 @@ RUNTIME_TEMPLATES = [
         'default_port': 3000,
         'migrate_command': None,
         'needs_database': False,
+        'tmpfs_paths': ['/app/.npm'],
         'detection_hints': {
             'priority': 60,
             'require_files': ['package.json'],

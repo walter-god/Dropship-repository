@@ -5,6 +5,7 @@ from rest_framework import status, viewsets, filters
 from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenRefreshView  # re-exported
@@ -28,6 +29,10 @@ class RegisterView(APIView):
     """
 
     permission_classes = [AllowAny]
+    # Unauthenticated and account-creating: needs a tighter bucket than the
+    # global 100/hour anon default.
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'register'
 
     def post(self, request):
         serializer = UserRegistrationSerializer(data=request.data)
@@ -55,6 +60,10 @@ class LoginView(APIView):
     """
 
     permission_classes = [AllowAny]
+    # Credential-guessing surface: the global anon bucket allows 100 attempts
+    # an hour, which is far too generous for a login endpoint.
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'login'
 
     def post(self, request):
         serializer = UserLoginSerializer(data=request.data, context={'request': request})

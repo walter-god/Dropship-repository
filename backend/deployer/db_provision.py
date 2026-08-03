@@ -5,11 +5,18 @@ that owns only that database. The role is NOSUPERUSER / NOCREATEDB /
 NOCREATEROLE, so the credentials injected into a student container cannot be
 used to reach the platform's own data.
 
-Note the honest limitation: Postgres grants CONNECT on every database to PUBLIC
-by default, so a determined app could still open a connection to another
-database — it just has no privileges on any object inside it. Fully sealing
-that off means revoking PUBLIC CONNECT cluster-wide, which is a deployment
-decision rather than something this module should do silently.
+PostgreSQL's defaults work against this: `template1` carries CONNECT for
+PUBLIC, which every new database inherits, so a student role could otherwise
+open a session to the platform's own database. `_harden_cluster()` revokes
+that, revokes PUBLIC's CREATE on the app's schema, and applies a per-role
+connection limit.
+
+Residual risk, documented in SECURITY.md rather than hidden here: DB-backed
+apps still have a TCP route to the shared Postgres instance, because the
+container needs to reach *a* database and this deployment shares one. The
+boundary is therefore authentication and privilege, not the network. A
+per-app Postgres sidecar would remove the route entirely, at roughly double
+the container count.
 """
 
 from __future__ import annotations
@@ -110,12 +117,89 @@ def provision(db_name: str, db_user: str, password: str) -> None:
                     sql.Identifier(db_name), sql.Identifier(db_user)
                 )
             )
+
+            # Bound concurrent connections so one app cannot exhaust the
+            # shared instance's connection slots and take the platform with it.
+            cur.execute(
+                sql.SQL('ALTER ROLE {} CONNECTION LIMIT %s').format(
+                    sql.Identifier(db_user)
+                ),
+                (settings.DEPLOYER_APP_DB_CONNECTION_LIMIT,),
+            )
+
+            _harden_cluster(cur, db_name, db_user)
     except psycopg2.Error as exc:
         raise ProvisioningError(f'Could not provision {db_name}: {exc}') from exc
     finally:
         conn.close()
 
     logger.info('Provisioned database %s owned by %s', db_name, db_user)
+
+
+def _harden_cluster(cur, app_db_name: str, app_db_user: str) -> None:
+    """Close the cross-database holes PostgreSQL leaves open by default.
+
+    Two defaults matter here. First, `template1` carries CONNECT for PUBLIC,
+    so every database — including the platform's own — is connectable by every
+    role unless explicitly revoked; provisioning only revoked on the app's own
+    database, leaving `udom_estore` reachable by every student role. Second, on
+    PostgreSQL < 15 PUBLIC holds CREATE on schema `public`, so a connected role
+    can create objects and consume disk even with no table grants.
+
+    Idempotent: REVOKE on an already-revoked privilege is a no-op.
+    """
+    platform_db = settings.DATABASES['default']['NAME']
+
+    # Stop student roles connecting to the platform database at all.
+    cur.execute(
+        sql.SQL('REVOKE CONNECT ON DATABASE {} FROM PUBLIC').format(
+            sql.Identifier(platform_db)
+        )
+    )
+    # Django connects as the owner/superuser, so it is unaffected by the above;
+    # re-grant explicitly in case the configured app user is not the owner.
+    cur.execute(
+        sql.SQL('GRANT CONNECT ON DATABASE {} TO {}').format(
+            sql.Identifier(platform_db),
+            sql.Identifier(settings.DATABASES['default']['USER']),
+        )
+    )
+    # New databases inherit template1's ACL, so fix the source too.
+    cur.execute('REVOKE CONNECT ON DATABASE template1 FROM PUBLIC')
+
+    # Deny PUBLIC object creation inside the app's own database, then hand the
+    # rights back to the app's own role. The re-grant is essential: on
+    # PostgreSQL < 15 schema `public` is owned by the bootstrap superuser, not
+    # by the database owner, so revoking from PUBLIC without this would strip
+    # the app's ability to create its own tables and break every migration.
+    try:
+        app_conn = psycopg2.connect(
+            host=settings.DEPLOYER_APP_DB_HOST,
+            port=settings.DEPLOYER_APP_DB_PORT,
+            user=settings.DEPLOYER_APP_DB_SUPERUSER,
+            password=settings.DEPLOYER_APP_DB_PASSWORD,
+            dbname=app_db_name,
+            connect_timeout=10,
+        )
+        app_conn.autocommit = True
+        try:
+            with app_conn.cursor() as app_cur:
+                app_cur.execute('REVOKE ALL ON SCHEMA public FROM PUBLIC')
+                app_cur.execute(
+                    sql.SQL('GRANT ALL ON SCHEMA public TO {}').format(
+                        sql.Identifier(app_db_user)
+                    )
+                )
+                app_cur.execute(
+                    sql.SQL('ALTER SCHEMA public OWNER TO {}').format(
+                        sql.Identifier(app_db_user)
+                    )
+                )
+        finally:
+            app_conn.close()
+    except psycopg2.Error as exc:
+        # Not fatal: the database is still isolated at the CONNECT layer.
+        logger.warning('Could not revoke PUBLIC on schema public in %s: %s', app_db_name, exc)
 
 
 def drop(db_name: str, db_user: str) -> None:

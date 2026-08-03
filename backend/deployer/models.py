@@ -35,6 +35,15 @@ class RuntimeTemplate(models.Model):
         help_text=_('Optional shell command run inside the container after start.'),
     )
     needs_database = models.BooleanField(default=False)
+    tmpfs_paths = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=_(
+            'Paths this runtime must be able to write to at runtime, mounted as '
+            'tmpfs because the root filesystem is read-only (e.g. Next.js writes '
+            '.next, Laravel writes storage/). /tmp is always mounted.'
+        ),
+    )
     detection_hints = models.JSONField(
         default=dict,
         blank=True,
@@ -57,6 +66,16 @@ class RuntimeTemplate(models.Model):
     @property
     def priority(self) -> int:
         return (self.detection_hints or {}).get('priority', 0)
+
+    def tmpfs_mounts(self, size_mb: int = 64) -> dict:
+        """Docker tmpfs spec for this runtime's writable paths.
+
+        Sized explicitly — an unbounded tmpfs is RAM the container can consume
+        past its own memory limit.
+        """
+        opts = f'rw,noexec,nosuid,nodev,size={size_mb}m'
+        paths = ['/tmp', *(self.tmpfs_paths or [])]
+        return {path: opts for path in paths}
 
     def render_dockerfile(self, **context) -> str:
         """Render the Dockerfile for a concrete app.

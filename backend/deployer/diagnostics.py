@@ -126,6 +126,9 @@ STAGE_FALLBACKS = {
     'build': 'The Docker build failed. See the build log for the full output.',
     'network': 'The per-app Docker network could not be created.',
     'run': 'The container could not be started.',
+    'verify': 'The container started but not under the required isolation, so it was '
+              'torn down. This is a host configuration problem, not a problem with '
+              'the submitted project.',
     'migrate': 'Database migrations failed.',
     'health': 'The app started but never returned HTTP 200 on its health path.',
 }

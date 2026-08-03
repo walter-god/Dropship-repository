@@ -3,17 +3,31 @@ version: '3.9'
 # Environment shared by every service running the backend image (web, worker,
 # beat). Anchored so the three can never drift out of sync.
 x-backend-env: &backend-env
-  SECRET_KEY: dev-secret-key-change-in-production
-  DEBUG: "True"
+  # All secrets come from a .env file (see .env.example) so nothing sensitive
+  # is committed. Compose substitutes ${VAR} from .env in this directory.
+  SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY in .env}
+  # DEBUG must stay False: Django's debug page dumps the full settings object,
+  # which includes SECRET_KEY — and because DEPLOYER_ENV_ENCRYPTION_KEY
+  # defaults to being derived from SECRET_KEY, leaking it decrypts every
+  # stored env var and database password.
+  DEBUG: "False"
   DB_NAME: udom_estore
   DB_USER: postgres
-  DB_PASSWORD: password
+  DB_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
   DB_HOST: db
   DB_PORT: "5432"
   ALLOWED_HOSTS: localhost,127.0.0.1,backend,udom_backend
   CORS_ALLOWED_ORIGINS: http://localhost:3000,http://frontend:3000
   CELERY_BROKER_URL: redis://redis:6379/0
   CELERY_RESULT_BACKEND: redis://redis:6379/1
+  CACHE_URL: redis://redis:6379/2
+  # Signature secret for the payment webhook. Empty => the endpoint rejects
+  # every request, which is the correct default for an unconfigured install.
+  PAYMENTS_WEBHOOK_SECRET: ${PAYMENTS_WEBHOOK_SECRET:-}
+  # Set explicitly so stored credentials survive a SECRET_KEY rotation.
+  DEPLOYER_ENV_ENCRYPTION_KEY: ${DEPLOYER_ENV_ENCRYPTION_KEY:-}
+  # Local dev over plain HTTP; set to True behind TLS.
+  SECURE_SSL_REDIRECT: "False"
   # Must match the container_name values below — the deployer looks itself up
   # by name to join per-app networks.
   DEPLOYER_ATTACH_CONTAINERS: udom_backend,udom_celery_worker
@@ -34,9 +48,12 @@ services:
     environment:
       POSTGRES_DB: udom_estore
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: password
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     ports:
-      - "5432:5432"
+      # Loopback only. Published on 0.0.0.0 this was superuser access to every
+      # tenant's data from anywhere routable — including, via the host gateway,
+      # from student containers.
+      - "127.0.0.1:5432:5432"
     networks:
       - udom_internal
     healthcheck:

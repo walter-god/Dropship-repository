@@ -5,6 +5,7 @@ from rest_framework import serializers
 
 from accounts.models import CustomUser
 from .models import Application, AppVersion, Category, Download, Review, Screenshot
+from .validators import validate_distributable, validate_source_archive
 
 
 # ---------------------------------------------------------------------------
@@ -158,16 +159,20 @@ class ApplicationDetailSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Application
+        # PUBLIC payload — `retrieve` is AllowAny, so anything listed here is
+        # world-readable. Deliberately excluded: source_code (the student's raw
+        # archive), deployment_notes and demo_credentials. Those live on
+        # ApplicationPrivilegedDetailSerializer below.
         fields = [
             'id', 'name', 'slug', 'developer', 'category',
             'description', 'short_description', 'version', 'app_file',
-            'source_code', 'icon', 'price', 'is_free', 'is_featured', 'is_active',
+            'icon', 'price', 'is_free', 'is_featured', 'is_active',
             'status', 'downloads_count', 'views_count',
             'min_os_version', 'size_bytes', 'tags', 'tag_list',
             'average_rating', 'review_count',
             'screenshots', 'reviews', 'versions',
             'detected_runtime_key', 'detection_confidence', 'detection_reason',
-            'needs_dockerfile', 'deployment_notes', 'demo_credentials',
+            'needs_dockerfile',
             'created_at', 'updated_at',
         ]
         read_only_fields = [
@@ -183,6 +188,19 @@ class ApplicationDetailSerializer(serializers.ModelSerializer):
 
     def get_review_count(self, obj) -> int:
         return obj.reviews.count()
+
+
+class ApplicationPrivilegedDetailSerializer(ApplicationDetailSerializer):
+    """Detail payload for the app's own developer, or an administrator.
+
+    Adds back the fields withheld from the public serializer. Selected in
+    ApplicationViewSet.get_serializer_class(); never reachable anonymously.
+    """
+
+    class Meta(ApplicationDetailSerializer.Meta):
+        fields = ApplicationDetailSerializer.Meta.fields + [
+            'source_code', 'deployment_notes', 'demo_credentials',
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +240,20 @@ class ApplicationCreateSerializer(serializers.ModelSerializer):
             'status': {'required': False},
         }
 
+    # Promotion and visibility are platform decisions, not author decisions.
+    ADMIN_ONLY_FIELDS = ('is_featured', 'is_active')
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        is_admin = bool(user and (getattr(user, 'is_admin', False) or user.is_staff))
+        if not is_admin:
+            # Without this a student can self-feature onto the homepage.
+            for name in self.ADMIN_ONLY_FIELDS:
+                if name in self.fields:
+                    self.fields[name].read_only = True
+
     def validate_status(self, value):
         request = self.context.get('request')
         # Only admins may directly approve / reject an app
@@ -231,6 +263,12 @@ class ApplicationCreateSerializer(serializers.ModelSerializer):
                     'Only administrators may set approved or rejected status.'
                 )
         return value
+
+    def validate_source_code(self, value):
+        return validate_source_archive(value)
+
+    def validate_app_file(self, value):
+        return validate_distributable(value)
 
     @staticmethod
     def _apply_detection(instance, source_file):

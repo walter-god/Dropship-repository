@@ -19,9 +19,9 @@ STATUS_COLORS = {
 class HostedAppAdmin(admin.ModelAdmin):
     list_display = (
         'application', 'status_badge', 'container_name', 'container_port',
-        'runtime_template', 'needs_database', 'last_active_at',
+        'runtime_template', 'needs_database', 'egress_badge', 'last_active_at',
     )
-    list_filter = ('status', 'needs_database', 'runtime_template')
+    list_filter = ('status', 'needs_database', 'allow_egress', 'runtime_template')
     search_fields = ('application__name', 'container_name', 'db_name')
     readonly_fields = (
         'container_id', 'container_name', 'network_name',
@@ -36,6 +36,13 @@ class HostedAppAdmin(admin.ModelAdmin):
             STATUS_COLORS.get(obj.status, '#888'),
             obj.get_status_display(),
         )
+
+    @admin.display(description='Egress', ordering='allow_egress', boolean=False)
+    def egress_badge(self, obj):
+        """Surfaced in the list because granting egress is a security decision."""
+        if obj.allow_egress:
+            return format_html('<span style="color:#f44336;font-weight:bold;">⚠ ALLOWED</span>')
+        return format_html('<span style="color:#00c853;">blocked</span>')
 
 
 @admin.register(AppSession)

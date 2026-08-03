@@ -30,6 +30,7 @@ from .docker_service import (
 from .dockerfile_validation import DockerfileValidationError, find_exposed_port, validate_dockerfile
 from .extraction import UnsafeArchive, cleanup_build_dir, safe_extract
 from .models import Deployment
+from .redaction import redact, secrets_from_environment
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,10 @@ class _LogSink:
     Writing every chunk straight through would mean one UPDATE per line of
     Docker output; batching keeps the admin's log live without hammering
     Postgres for the length of a build.
+
+    Everything is redacted on the way out. Build output and migrate output are
+    both student-controlled, and the migrate step in particular runs the
+    student's own code with the database credentials in its environment.
     """
 
     def __init__(self, deployment: Deployment, interval: float):
@@ -80,11 +85,21 @@ class _LogSink:
         self._interval = interval
         self._buffer: list[str] = []
         self._last_flush = time.monotonic()
+        self._secrets: list[str] = []
+
+    def add_secrets(self, secrets_: list[str]) -> None:
+        """Register literal values to strip from all subsequent output."""
+        self._secrets = sorted(set(self._secrets) | set(secrets_), key=len, reverse=True)
+
+    @property
+    def secrets(self) -> list[str]:
+        """Literals registered so far, for redacting sinks other than the log."""
+        return list(self._secrets)
 
     def write(self, text: str) -> None:
         if not text:
             return
-        self._buffer.append(text)
+        self._buffer.append(redact(text, self._secrets))
         if time.monotonic() - self._last_flush >= self._interval:
             self.flush()
 
@@ -124,6 +139,49 @@ def _build_environment(hosted_app: HostedApp, database_url: str, container_name:
     env.update({k: v for k, v in env_vars.items() if k != 'SECRET_KEY'})
     env['SECRET_KEY'] = env_vars['SECRET_KEY']
     return env
+
+
+def _verify_limits(svc, ref: str, sink, *, memory_mb: int, cpu_limit: float,
+                   network_name: str) -> None:
+    """Assert the container is running under the isolation we asked for.
+
+    Fails the deploy rather than logging a warning: a container running
+    without its memory cap, without a read-only rootfs, as root, or with a
+    host mount is a containment failure, and hostile code is inside it.
+    """
+    applied = svc.inspect_limits(ref)
+    expected_memory = memory_mb * 1024 * 1024
+    expected_cpus = int(cpu_limit * 1_000_000_000)
+
+    problems = []
+    if applied.memory_bytes != expected_memory:
+        problems.append(f'memory {applied.memory_bytes} != {expected_memory}')
+    if applied.nano_cpus != expected_cpus:
+        problems.append(f'nano_cpus {applied.nano_cpus} != {expected_cpus}')
+    if applied.pids_limit != settings.DEPLOYER_PIDS_LIMIT:
+        problems.append(f'pids_limit {applied.pids_limit} != {settings.DEPLOYER_PIDS_LIMIT}')
+    if 'ALL' not in {c.upper() for c in applied.cap_drop}:
+        problems.append(f'capabilities not dropped (cap_drop={applied.cap_drop})')
+    if not applied.read_only_rootfs:
+        problems.append('root filesystem is writable')
+    if applied.privileged:
+        problems.append('container is privileged')
+    if applied.user != settings.DEPLOYER_CONTAINER_USER:
+        problems.append(f'user {applied.user!r} != {settings.DEPLOYER_CONTAINER_USER!r}')
+    if applied.network_mode != network_name:
+        problems.append(f'network {applied.network_mode!r} != {network_name!r}')
+    if applied.mounts:
+        problems.append(f'unexpected host mounts: {applied.mounts}')
+
+    if problems:
+        raise DeploymentError(
+            'verify',
+            'The container did not start under the required isolation: '
+            + '; '.join(problems)
+            + '. This usually means the host kernel or cgroup driver does not '
+              'support a limit the platform depends on.',
+        )
+    sink.write('    isolation verified (memory, cpu, pids, caps, read-only, network)\n')
 
 
 def _wait_until_running(svc, ref: str, timeout: int = 20) -> None:
@@ -180,8 +238,14 @@ def _wait_for_health(svc, container_name: str, port: int, health_path: str, sink
     )
 
 
-def _notify(hosted_app: HostedApp, subject: str, body: str) -> None:
-    """Best-effort notification to the developer. Never fails a deploy."""
+def _notify(hosted_app: HostedApp, subject: str, body: str, secrets_: list[str] | None = None) -> None:
+    """Best-effort notification to the developer. Never fails a deploy.
+
+    Redacts again rather than trusting the caller: this body reaches two sinks
+    outside the database (SMTP and the application log), and both persist
+    beyond anything the admin UI shows.
+    """
+    body = redact(body, secrets_ or [])
     recipient = getattr(hosted_app.application.developer, 'email', '')
     logger.info('%s — %s', subject, body)
     if not recipient:
@@ -349,9 +413,17 @@ def run_deployment(hosted_app: HostedApp, deployment: Deployment) -> None:
 
         # -- 6. network ---------------------------------------------------
         stage = 'network'
-        sink.write(f'==> Creating network {network_name}\n')
-        svc.ensure_network(network_name, labels=labels)
+        internal = not hosted_app.allow_egress
+        sink.write(
+            f'==> Creating network {network_name} '
+            f'({"no outbound internet" if internal else "EGRESS ALLOWED"})\n'
+        )
+        svc.ensure_network(network_name, labels=labels, internal=internal)
         made_network = True
+        if not internal:
+            logger.warning(
+                'App %s is running WITH outbound egress (allow_egress=True).', slug
+            )
 
         # Platform containers join before the app starts, so the health check
         # and any database traffic work from the first moment it boots.
@@ -383,18 +455,45 @@ def run_deployment(hosted_app: HostedApp, deployment: Deployment) -> None:
             svc.remove_container(container_name)
 
         sink.write(f'==> Starting container {container_name}\n')
+        memory_mb = hosted_app.memory_limit_mb or settings.DEPLOYER_DEFAULT_MEMORY_MB
+        cpu_limit = hosted_app.cpu_limit or settings.DEPLOYER_DEFAULT_CPU
+        # A read-only root filesystem needs explicit writable paths. With no
+        # template (a custom Dockerfile) only /tmp is granted, since we cannot
+        # know what that image expects to write.
+        tmpfs = (
+            template.tmpfs_mounts(settings.DEPLOYER_TMPFS_SIZE_MB)
+            if template is not None
+            else {'/tmp': f'rw,noexec,nosuid,nodev,size={settings.DEPLOYER_TMPFS_SIZE_MB}m'}
+        )
+        container_env = _build_environment(hosted_app, database_url, container_name)
+        # Register the live credentials before anything student-controlled can
+        # be logged — the migrate step below runs the student's own code with
+        # exactly these values in its environment.
+        sink.add_secrets(secrets_from_environment(container_env))
+
         info = svc.run_container(
             image_tag=image_tag,
             name=container_name,
             network=network_name,
-            environment=_build_environment(hosted_app, database_url, container_name),
-            memory_mb=hosted_app.memory_limit_mb or settings.DEPLOYER_DEFAULT_MEMORY_MB,
-            cpu_limit=hosted_app.cpu_limit or settings.DEPLOYER_DEFAULT_CPU,
+            environment=container_env,
+            memory_mb=memory_mb,
+            cpu_limit=cpu_limit,
             user=settings.DEPLOYER_CONTAINER_USER,
             pids_limit=settings.DEPLOYER_PIDS_LIMIT,
             labels=labels,
+            tmpfs=tmpfs,
+            read_only=True,
+            ulimits=settings.DEPLOYER_ULIMITS,
         )
         made_container = True
+
+        # Verify the daemon actually applied the limits. Docker only *warns*
+        # when a cgroup feature is unavailable, so without this a deploy could
+        # report success while running with no memory or pids cap at all.
+        _verify_limits(
+            svc, container_name, sink,
+            memory_mb=memory_mb, cpu_limit=cpu_limit, network_name=network_name,
+        )
 
         # -- 8. migrate ---------------------------------------------------
         stage = 'migrate'
@@ -456,11 +555,21 @@ def run_deployment(hosted_app: HostedApp, deployment: Deployment) -> None:
         if made_container and not container_log:
             container_log = svc.container_logs(container_name, tail=200)
 
-        summary = diagnostics.summarize_failure(
-            stage=stage,
-            build_log=deployment.build_log,
-            container_log=container_log,
-            error=message,
+        # container_log and `message` are student-controlled, and the exception
+        # text from a failed DB connection can embed the DSN. Redact before
+        # anything is persisted, summarised, or emailed.
+        known_secrets = sink.secrets
+        container_log = redact(container_log, known_secrets)
+        message = redact(message, known_secrets)
+
+        summary = redact(
+            diagnostics.summarize_failure(
+                stage=stage,
+                build_log=deployment.build_log,
+                container_log=container_log,
+                error=message,
+            ),
+            known_secrets,
         )
 
         if container_log:
@@ -489,6 +598,7 @@ def run_deployment(hosted_app: HostedApp, deployment: Deployment) -> None:
             hosted_app,
             f'{hosted_app.application.name} failed to deploy',
             summary,
+            secrets_=known_secrets,
         )
 
     finally:
