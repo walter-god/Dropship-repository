@@ -65,6 +65,13 @@ export const marketplaceAPI = {
   createApp: (data) => api.post('/marketplace/apps/', data, { headers: { 'Content-Type': 'multipart/form-data' } }),
   updateApp: (id, data) => api.patch(`/marketplace/apps/${id}/`, data, { headers: { 'Content-Type': 'multipart/form-data' } }),
   deleteApp: (id) => api.delete(`/marketplace/apps/${id}/`),
+  detectStack: (sourceCodeFile) => {
+    const form = new FormData();
+    form.append('source_code', sourceCodeFile);
+    return api.post('/marketplace/apps/detect-stack/', form, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    });
+  },
   downloadApp: (id) => api.post(`/marketplace/apps/${id}/download/`),
   approveApp: (id) => api.post(`/marketplace/apps/${id}/approve/`),
   rejectApp: (id, reason) => api.post(`/marketplace/apps/${id}/reject/`, { reason }),

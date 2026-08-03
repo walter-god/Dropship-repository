@@ -161,16 +161,19 @@ class ApplicationDetailSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'slug', 'developer', 'category',
             'description', 'short_description', 'version', 'app_file',
-            'icon', 'price', 'is_free', 'is_featured', 'is_active',
+            'source_code', 'icon', 'price', 'is_free', 'is_featured', 'is_active',
             'status', 'downloads_count', 'views_count',
             'min_os_version', 'size_bytes', 'tags', 'tag_list',
             'average_rating', 'review_count',
             'screenshots', 'reviews', 'versions',
+            'detected_runtime_key', 'detection_confidence', 'detection_reason',
+            'needs_dockerfile', 'deployment_notes', 'demo_credentials',
             'created_at', 'updated_at',
         ]
         read_only_fields = [
             'id', 'slug', 'downloads_count', 'views_count',
-            'created_at', 'updated_at',
+            'detected_runtime_key', 'detection_confidence', 'detection_reason',
+            'needs_dockerfile', 'created_at', 'updated_at',
         ]
 
     def get_average_rating(self, obj):
@@ -203,12 +206,18 @@ class ApplicationCreateSerializer(serializers.ModelSerializer):
         model = Application
         fields = [
             'id', 'name', 'category', 'description', 'short_description',
-            'version', 'app_file', 'icon', 'price',
+            'version', 'app_file', 'source_code', 'icon', 'price',
             'min_os_version', 'size_bytes', 'tags',
             'is_featured', 'is_active', 'status',
+            'deployment_notes', 'demo_credentials',
+            'detected_runtime_key', 'detection_confidence', 'detection_reason',
+            'needs_dockerfile',
             'screenshots', 'uploaded_screenshots',
         ]
-        read_only_fields = ['id']
+        read_only_fields = [
+            'id', 'detected_runtime_key', 'detection_confidence',
+            'detection_reason', 'needs_dockerfile',
+        ]
         extra_kwargs = {
             'status': {'required': False},
         }
@@ -223,22 +232,58 @@ class ApplicationCreateSerializer(serializers.ModelSerializer):
                 )
         return value
 
+    @staticmethod
+    def _apply_detection(instance, source_file):
+        """Run stack detection against a freshly uploaded source archive.
+
+        Runs whenever source_code is set or replaced, so the result is
+        visible to both the student and the admin without a separate step —
+        detection here always agrees with the stateless preview endpoint,
+        because both call the same detect_from_archive().
+        """
+        if not source_file:
+            return
+        from deployer.detection import detect_from_archive
+
+        try:
+            source_file.seek(0)
+        except (AttributeError, ValueError):
+            pass
+        result = detect_from_archive(source_file)
+        try:
+            source_file.seek(0)
+        except (AttributeError, ValueError):
+            pass
+
+        instance.detected_runtime_key = result['runtime_key']
+        instance.detection_confidence = result['confidence']
+        instance.detection_reason = result['reason']
+        instance.needs_dockerfile = result['needs_dockerfile']
+
     def create(self, validated_data):
         uploaded_screenshots = validated_data.pop('uploaded_screenshots', [])
         request = self.context['request']
-        application = Application.objects.create(
-            developer=request.user,
-            **validated_data,
-        )
+        source_file = validated_data.get('source_code')
+
+        application = Application(developer=request.user, **validated_data)
+        self._apply_detection(application, source_file)
+        application.save()
+
         for idx, image in enumerate(uploaded_screenshots):
             Screenshot.objects.create(app=application, image=image, order=idx)
         return application
 
     def update(self, instance, validated_data):
         uploaded_screenshots = validated_data.pop('uploaded_screenshots', None)
+        source_file = validated_data.get('source_code')
+        source_changed = 'source_code' in validated_data
+
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
+        if source_changed:
+            self._apply_detection(instance, source_file)
         instance.save()
+
         if uploaded_screenshots is not None:
             # Replace existing screenshots with the new set
             instance.screenshots.all().delete()

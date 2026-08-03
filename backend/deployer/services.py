@@ -27,6 +27,7 @@ from .docker_service import (
     DockerServiceError,
     get_docker_service,
 )
+from .dockerfile_validation import DockerfileValidationError, find_exposed_port, validate_dockerfile
 from .extraction import UnsafeArchive, cleanup_build_dir, safe_extract
 from .models import Deployment
 
@@ -234,10 +235,35 @@ def run_deployment(hosted_app: HostedApp, deployment: Deployment) -> None:
 
         # -- 3. Dockerfile ------------------------------------------------
         stage = 'detect'
-        template = hosted_app.runtime_template
-        if extracted.has_dockerfile:
-            dockerfile = 'Dockerfile'
+        port_override = deployment.requested_container_port
+        # Precedence: admin-supplied override > zip-supplied Dockerfile >
+        # explicit template override from the deploy request > auto-detect.
+        template = deployment.requested_runtime_template or hosted_app.runtime_template
+
+        custom_dockerfile = (
+            hosted_app.admin_dockerfile_override.strip() or extracted.has_dockerfile
+        )
+        if hosted_app.admin_dockerfile_override.strip():
+            sink.write('==> Using the Dockerfile uploaded by an admin\n')
+            dockerfile_text = hosted_app.admin_dockerfile_override
+            dockerfile = 'Dockerfile.udom-admin'
+            (extracted.root / dockerfile).write_text(dockerfile_text, encoding='utf-8')
+        elif extracted.has_dockerfile:
             sink.write('==> Using the Dockerfile supplied in the archive\n')
+            dockerfile = 'Dockerfile'
+            dockerfile_text = (extracted.root / dockerfile).read_text(
+                encoding='utf-8', errors='replace'
+            )
+
+        if custom_dockerfile:
+            stage = 'validate'
+            validate_dockerfile(dockerfile_text, port_override=port_override)
+            stage = 'detect'
+            # A supplied Dockerfile means no template applies. Its own EXPOSE
+            # is the port of record unless the admin explicitly overrode it —
+            # validate_dockerfile already guaranteed one of the two exists.
+            template = None
+            port_override = port_override or find_exposed_port(dockerfile_text)
         else:
             if template is None:
                 template = detect_runtime(extracted.root)
@@ -256,12 +282,28 @@ def run_deployment(hosted_app: HostedApp, deployment: Deployment) -> None:
 
         if template is not None:
             hosted_app.runtime_template = template
-            hosted_app.container_port = template.default_port
-            hosted_app.needs_database = template.needs_database
+            hosted_app.container_port = port_override or template.default_port
+            hosted_app.needs_database = (
+                template.needs_database
+                if deployment.requested_provision_database is None
+                else deployment.requested_provision_database
+            )
             hosted_app.save(
                 update_fields=[
                     'runtime_template', 'container_port', 'needs_database', 'updated_at'
                 ]
+            )
+        else:
+            # A Dockerfile was supplied directly — no template to source
+            # defaults from, so the deploy request (or the current HostedApp
+            # settings) is the only source of truth.
+            hosted_app.runtime_template = None
+            if port_override:
+                hosted_app.container_port = port_override
+            if deployment.requested_provision_database is not None:
+                hosted_app.needs_database = deployment.requested_provision_database
+            hosted_app.save(
+                update_fields=['runtime_template', 'container_port', 'needs_database', 'updated_at']
             )
 
         # -- 4. database --------------------------------------------------

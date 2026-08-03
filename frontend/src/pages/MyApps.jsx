@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, Link } from 'react-router-dom';
 import { marketplaceAPI } from '../api';
 import { useAuth } from '../context/AuthContext';
 
@@ -73,9 +73,12 @@ export default function MyApps() {
           <h1>My Applications</h1>
           <p>Manage and track your submitted apps</p>
         </div>
-        <button className="btn btn-primary" onClick={() => setShowForm(!showForm)}>
-          {showForm ? '✕ Cancel' : '+ Submit New App'}
-        </button>
+        <div style={{ display: 'flex', gap: 10 }}>
+          <Link to="/upload-project" className="btn btn-outline">📦 Upload Project Source</Link>
+          <button className="btn btn-primary" onClick={() => setShowForm(!showForm)}>
+            {showForm ? '✕ Cancel' : '+ Submit New App'}
+          </button>
+        </div>
       </div>
 
       {/* Submit Form */}

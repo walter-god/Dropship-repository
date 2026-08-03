@@ -94,6 +94,30 @@ class Deployment(models.Model):
         on_delete=models.CASCADE,
         related_name='deployments',
     )
+
+    # Per-run overrides captured from the deploy request, so a single build can
+    # honour an admin's choices (drawer override, DB checkbox, custom port)
+    # without mutating HostedApp until the build actually succeeds.
+    requested_runtime_template = models.ForeignKey(
+        'RuntimeTemplate',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='+',
+        help_text=_('Explicit override from the deploy drawer; null means auto-detect.'),
+    )
+    requested_provision_database = models.BooleanField(
+        null=True,
+        blank=True,
+        help_text=_('Null defers to the runtime template / current HostedApp setting.'),
+    )
+    requested_container_port = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=_('Explicit port override — required when a custom Dockerfile has no '
+                     'EXPOSE instruction.'),
+    )
+
     status = models.CharField(
         max_length=20,
         choices=STATUS_CHOICES,

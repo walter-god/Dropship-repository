@@ -120,6 +120,7 @@ RUNTIME_PATTERNS: list[tuple[str, str]] = [
 
 STAGE_FALLBACKS = {
     'extract': 'The uploaded archive could not be extracted.',
+    'validate': 'The supplied Dockerfile was rejected before the build started.',
     'detect': 'No runtime template matched this project, and it contains no Dockerfile.',
     'database': 'The dedicated Postgres database could not be provisioned.',
     'build': 'The Docker build failed. See the build log for the full output.',

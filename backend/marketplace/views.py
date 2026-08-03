@@ -152,6 +152,27 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             return self.get_paginated_response(serializer.data)
         return Response(serializer.data)
 
+    @action(
+        detail=False, methods=['post'], url_path='detect-stack',
+        permission_classes=[IsAuthenticated],
+    )
+    def detect_stack(self, request):
+        """
+        POST /api/marketplace/apps/detect-stack/
+        Stateless stack detection for the upload flow: takes a `source_code`
+        zip in the request body and returns the detection result without
+        creating or touching any Application row. Lets a student see
+        "Detected: Django" before they've even picked a name for the project.
+        """
+        upload = request.FILES.get('source_code')
+        if not upload:
+            return Response(
+                {'error': "A 'source_code' zip file is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        from deployer.detection import detect_from_archive
+        return Response(detect_from_archive(upload))
+
     @action(detail=True, methods=['post'], url_path='download')
     def download(self, request, pk=None):
         """

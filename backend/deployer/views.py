@@ -15,18 +15,22 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from gateway.models import HostedApp
+from gateway.models import AppSession, HostedApp
 from marketplace.models import Application
 from marketplace.permissions import IsAdminUser
 
 from . import services, tasks
-from .models import Deployment
+from .models import Deployment, RuntimeTemplate
 from .serializers import (
+    AppSessionSerializer,
+    DeployRequestSerializer,
     DeploymentDetailSerializer,
     DeploymentSummarySerializer,
+    DockerfileUploadSerializer,
     EnvVarsSerializer,
     HostedAppSerializer,
     LogsSerializer,
+    RuntimeTemplateSerializer,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,8 +61,51 @@ class DeployerViewSet(viewsets.GenericViewSet):
     def _conflict(message: str) -> Response:
         return Response({'error': message}, status=status.HTTP_409_CONFLICT)
 
-    def _enqueue_build(self, request, hosted_app: HostedApp, application: Application):
-        """Shared by deploy and redeploy."""
+    # -- list / retrieve -----------------------------------------------------
+    # GenericViewSet adds no routes on its own; these back the admin table
+    # (one row per approved/published project) and the single-app fetch the
+    # deploy drawer and log modal poll.
+
+    def list(self, request):
+        """GET /api/deployer/apps/ — one row per approved/published project."""
+        queryset = (
+            self.queryset.filter(status__in=DEPLOYABLE_STATUSES)
+            .select_related('developer', 'category')
+            .order_by('-updated_at')
+        )
+        page = self.paginate_queryset(queryset)
+        applications = list(page if page is not None else queryset)
+
+        # Avoid an N+1 get_or_create: fetch every HostedApp that already
+        # exists in one query, and only create rows for apps deployed for
+        # the first time.
+        existing = {
+            h.application_id: h
+            for h in HostedApp.objects.filter(application__in=applications)
+            .select_related('runtime_template', 'application', 'application__developer')
+        }
+        hosted_apps = [existing.get(a.pk) or self._hosted_app(a) for a in applications]
+
+        serializer = HostedAppSerializer(hosted_apps, many=True)
+        if page is not None:
+            return self.get_paginated_response(serializer.data)
+        return Response(serializer.data)
+
+    def retrieve(self, request, pk=None):
+        """GET /api/deployer/apps/<pk>/ — single hosted app detail."""
+        hosted_app = self._hosted_app(self._application())
+        return Response(HostedAppSerializer(hosted_app).data)
+
+    def _enqueue_build(
+        self, request, hosted_app: HostedApp, application: Application, overrides: dict | None = None
+    ):
+        """Shared by deploy, redeploy, and the env-action's redeploy shortcut.
+
+        `overrides` holds already-validated per-run choices from the deploy
+        drawer (runtime template, database checkbox, port). None means "use
+        auto-detection / the app's current settings", which is what a plain
+        rebuild from the env action wants.
+        """
         if application.status not in DEPLOYABLE_STATUSES:
             return Response(
                 {
@@ -79,10 +126,14 @@ class DeployerViewSet(viewsets.GenericViewSet):
                 f'A deployment is already in progress (status: {hosted_app.status}).'
             )
 
+        overrides = overrides or {}
         deployment = Deployment.objects.create(
             hosted_app=hosted_app,
             status=Deployment.STATUS_QUEUED,
             triggered_by=request.user,
+            requested_runtime_template_id=overrides.get('runtime_template_id'),
+            requested_provision_database=overrides.get('provision_database'),
+            requested_container_port=overrides.get('container_port'),
         )
         hosted_app.mark(HostedApp.STATUS_QUEUED)
         tasks.deploy_app.delay(hosted_app.pk, deployment.pk)
@@ -96,19 +147,48 @@ class DeployerViewSet(viewsets.GenericViewSet):
             status=status.HTTP_202_ACCEPTED,
         )
 
+    def _deploy_or_redeploy(self, request, pk):
+        """Validate the deploy-drawer payload, apply resource/env changes to
+        the HostedApp immediately, and queue the build with the rest as
+        per-run overrides."""
+        application = self._application()
+        hosted_app = self._hosted_app(application)
+
+        serializer = DeployRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        update_fields = []
+        if 'memory_limit_mb' in data:
+            hosted_app.memory_limit_mb = data['memory_limit_mb']
+            update_fields.append('memory_limit_mb')
+        if 'cpu_limit' in data:
+            hosted_app.cpu_limit = data['cpu_limit']
+            update_fields.append('cpu_limit')
+        if 'env_vars' in data:
+            hosted_app.env_vars = data['env_vars']
+            update_fields.append('env_vars')
+        if update_fields:
+            hosted_app.save(update_fields=[*update_fields, 'updated_at'])
+
+        overrides = {
+            'runtime_template_id': data.get('runtime_template_id'),
+            'provision_database': data.get('provision_database'),
+            'container_port': data.get('container_port'),
+        }
+        return self._enqueue_build(request, hosted_app, application, overrides=overrides)
+
     # -- endpoints ---------------------------------------------------------
 
     @action(detail=True, methods=['post'])
     def deploy(self, request, pk=None):
         """POST /api/deployer/apps/<pk>/deploy/"""
-        application = self._application()
-        return self._enqueue_build(request, self._hosted_app(application), application)
+        return self._deploy_or_redeploy(request, pk)
 
     @action(detail=True, methods=['post'])
     def redeploy(self, request, pk=None):
         """POST /api/deployer/apps/<pk>/redeploy/ — rebuild from current source."""
-        application = self._application()
-        return self._enqueue_build(request, self._hosted_app(application), application)
+        return self._deploy_or_redeploy(request, pk)
 
     @action(detail=True, methods=['post'])
     def stop(self, request, pk=None):
@@ -251,3 +331,64 @@ class DeployerViewSet(viewsets.GenericViewSet):
                 'hosted_app': HostedAppSerializer(hosted_app).data,
             }
         )
+
+    @action(detail=True, methods=['get'])
+    def sessions(self, request, pk=None):
+        """GET /api/deployer/apps/<pk>/sessions/ — active AppSessions."""
+        hosted_app = self._hosted_app(self._application())
+        queryset = hosted_app.sessions.select_related('user').order_by('-last_seen_at')
+        if str(request.query_params.get('active_only', 'true')).lower() != 'false':
+            queryset = queryset.filter(ended_at__isnull=True)
+        return Response(AppSessionSerializer(queryset, many=True).data)
+
+    @action(
+        detail=True, methods=['post'],
+        url_path='sessions/(?P<session_id>[0-9]+)/revoke',
+    )
+    def revoke_session(self, request, pk=None, session_id=None):
+        """POST /api/deployer/apps/<pk>/sessions/<session_id>/revoke/"""
+        hosted_app = self._hosted_app(self._application())
+        session = get_object_or_404(hosted_app.sessions, pk=session_id)
+        session.revoke()
+        return Response(
+            {'message': 'Session revoked.', 'session': AppSessionSerializer(session).data}
+        )
+
+    @action(detail=True, methods=['patch'], url_path='dockerfile')
+    def dockerfile(self, request, pk=None):
+        """
+        PATCH /api/deployer/apps/<pk>/dockerfile/
+        Upload (or clear) a Dockerfile on the student's behalf — for projects
+        whose author has graduated or gone unresponsive. Takes precedence over
+        both a zip-supplied Dockerfile and the runtime template on the next
+        deploy; does not trigger a build by itself.
+        """
+        hosted_app = self._hosted_app(self._application())
+        serializer = DockerfileUploadSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        hosted_app.admin_dockerfile_override = serializer.validated_data['dockerfile']
+        hosted_app.save(update_fields=['admin_dockerfile_override', 'updated_at'])
+
+        cleared = not hosted_app.admin_dockerfile_override.strip()
+        return Response(
+            {
+                'message': 'Dockerfile override cleared.' if cleared
+                else 'Dockerfile override saved. It will be used on the next deploy.',
+                'hosted_app': HostedAppSerializer(hosted_app).data,
+            }
+        )
+
+
+class RuntimeTemplateViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    GET /api/deployer/runtime-templates/
+    Read-only listing so the deploy drawer can offer a runtime override.
+    Unpaginated: this is a short, fixed catalogue meant to populate a single
+    dropdown, not a browsable collection.
+    """
+
+    queryset = RuntimeTemplate.objects.all().order_by('key')
+    serializer_class = RuntimeTemplateSerializer
+    permission_classes = [IsAuthenticated, IsAdminUser]
+    pagination_class = None

@@ -87,6 +87,16 @@ class HostedApp(models.Model):
         help_text=_('Admin-supplied environment variables, encrypted at rest.'),
     )
 
+    admin_dockerfile_override = models.TextField(
+        blank=True,
+        default='',
+        help_text=_(
+            'A Dockerfile supplied by an admin on the student’s behalf — takes '
+            'precedence over both a zip-supplied Dockerfile and the runtime template. '
+            'Cleared by setting to an empty string.'
+        ),
+    )
+
     memory_limit_mb = models.PositiveIntegerField(default=512)
     cpu_limit = models.FloatField(default=0.5)
 
@@ -151,6 +161,11 @@ class AppSession(models.Model):
     started_at = models.DateTimeField(auto_now_add=True)
     last_seen_at = models.DateTimeField(default=timezone.now, db_index=True)
     ended_at = models.DateTimeField(null=True, blank=True)
+    ip_address = models.GenericIPAddressField(
+        null=True,
+        blank=True,
+        help_text=_('Populated by the gateway proxy once it exists; empty until then.'),
+    )
 
     class Meta:
         verbose_name = _('App Session')
@@ -170,6 +185,10 @@ class AppSession(models.Model):
     def touch(self):
         self.last_seen_at = timezone.now()
         self.save(update_fields=['last_seen_at'])
+
+    def revoke(self):
+        self.ended_at = timezone.now()
+        self.save(update_fields=['ended_at'])
 
 
 class AllowedHostname(models.Model):

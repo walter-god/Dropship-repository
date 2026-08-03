@@ -73,7 +73,13 @@ class Application(models.Model):
     version = models.CharField(max_length=50, default='1.0.0')
     app_file = models.FileField(
         upload_to='apps/files/',
-        help_text=_('Uploadable package (APK, IPA, ZIP, etc.).'),
+        blank=True,
+        null=True,
+        help_text=_(
+            'Uploadable package (APK, IPA, ZIP, etc.). Optional for projects deployed '
+            'from source_code — a web app hosted by the platform has nothing separate '
+            'to download.'
+        ),
     )
     source_code = models.FileField(
         upload_to='projects/source/',
@@ -83,6 +89,50 @@ class Application(models.Model):
             'Zipped project source. This is the build input for the deployment '
             'pipeline, distinct from app_file which is the distributable package.'
         ),
+    )
+
+    # Populated automatically whenever source_code is set or changed (see
+    # ApplicationCreateSerializer). CONFIDENCE_CHOICES mirrors what the
+    # detector actually returns, so the admin UI can render a single pill
+    # instead of interpreting a free-form string.
+    CONFIDENCE_HIGH = 'high'
+    CONFIDENCE_LOW = 'low'
+    CONFIDENCE_NONE = 'none'
+    CONFIDENCE_CHOICES = [
+        (CONFIDENCE_HIGH, _('High')),
+        (CONFIDENCE_LOW, _('Low')),
+        (CONFIDENCE_NONE, _('Unrecognized')),
+    ]
+    detected_runtime_key = models.CharField(
+        max_length=50,
+        blank=True,
+        default='',
+        help_text=_("Auto-detected runtime key, e.g. 'python-flask', or 'custom' for a "
+                     'project that already ships its own Dockerfile.'),
+    )
+    detection_confidence = models.CharField(
+        max_length=10,
+        choices=CONFIDENCE_CHOICES,
+        blank=True,
+        default='',
+    )
+    detection_reason = models.CharField(max_length=300, blank=True, default='')
+    needs_dockerfile = models.BooleanField(
+        default=False,
+        help_text=_('True when the stack was recognized but has no Tier-A template — '
+                     'the student must supply their own Dockerfile.'),
+    )
+
+    deployment_notes = models.TextField(
+        blank=True,
+        default='',
+        help_text=_('Developer-written notes for whoever deploys this (build quirks, '
+                     'required env vars, etc.). Shown read-only to the admin.'),
+    )
+    demo_credentials = models.TextField(
+        blank=True,
+        default='',
+        help_text=_('Optional login details for reviewers to exercise the running app.'),
     )
     icon = models.ImageField(
         upload_to='apps/icons/',

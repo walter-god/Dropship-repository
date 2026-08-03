@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, Link } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { authAPI, marketplaceAPI, subscriptionsAPI, paymentsAPI } from '../api';
 
@@ -112,6 +112,7 @@ export default function AdminPanel() {
             {t.charAt(0).toUpperCase() + t.slice(1)}
           </button>
         ))}
+        <Link to="/admin/hosted-apps" className="tab-btn">🚀 Hosted Apps</Link>
       </div>
 
       <div className="admin-content">
